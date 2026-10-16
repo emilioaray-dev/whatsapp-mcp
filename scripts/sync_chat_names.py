@@ -23,14 +23,16 @@ from pathlib import Path
 
 STORE = Path(__file__).resolve().parent.parent / "whatsapp-bridge" / "store"
 OSA = '''tell application "Contacts"
+set ns to name of every person
+set ps to value of phones of every person
+end tell
 set out to ""
-repeat with p in people
-  repeat with ph in phones of p
-    set out to out & (name of p) & tab & (value of ph) & linefeed
+repeat with i from 1 to count of ns
+  repeat with ph in item i of ps
+    set out to out & item i of ns & tab & ph & linefeed
   end repeat
 end repeat
-return out
-end tell'''
+return out'''
 
 
 def key(phone: str) -> str | None:
@@ -43,9 +45,9 @@ def mac_contacts() -> dict[str, str]:
     if sys.platform != "darwin":
         return {}
     try:  # sin permiso de Contactos (TCC) osascript espera un dialogo: no colgar la tarea
-        r = subprocess.run(["osascript", "-e", OSA], capture_output=True, text=True, timeout=60)
+        r = subprocess.run(["osascript", "-e", OSA], capture_output=True, text=True, timeout=120)
     except subprocess.TimeoutExpired:
-        print("aviso: Contactos de macOS sin respuesta en 60s (permiso de privacidad pendiente); se usan solo nombres de WhatsApp", file=sys.stderr)
+        print("aviso: Contactos de macOS sin respuesta en 120s (permiso de privacidad pendiente); se usan solo nombres de WhatsApp", file=sys.stderr)
         return {}
     if r.returncode != 0:
         print(f"aviso: Contactos de macOS no disponible ({r.stderr.strip()[:80]})", file=sys.stderr)
