@@ -203,7 +203,8 @@ type SendMessageRequest struct {
 }
 
 // Function to send a WhatsApp message
-func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message string, mediaPath string) (bool, string) {
+// mediaData must already have been read through readMediaFile; mediaPath only names it.
+func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message string, mediaPath string, mediaData []byte) (bool, string) {
 	if !client.IsConnected() {
 		return false, "Not connected to WhatsApp"
 	}
@@ -233,12 +234,6 @@ func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message str
 
 	// Check if we have media to send
 	if mediaPath != "" {
-		// Read media file
-		mediaData, err := os.ReadFile(mediaPath)
-		if err != nil {
-			return false, fmt.Sprintf("Error reading media file: %v", err)
-		}
-
 		// Determine media type and mime type based on file extension
 		fileExt := strings.ToLower(mediaPath[strings.LastIndex(mediaPath, ".")+1:])
 		var mediaType whatsmeow.MediaType
@@ -587,9 +582,8 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 	}
 
 	// The filename is chosen by whoever sent the media: reduce it to one safe path component
-	if filename = safeFilename(filename); filename == "" {
-		filename = fallbackFilename(messageID)
-	}
+	// and prefix the message ID so a planted file can never be served for another message
+	filename = mediaFilename(messageID, filename)
 	chatDir, localPath, err := storeMediaPath("store", chatJID, filename)
 	if err != nil {
 		return false, "", "", "", fmt.Errorf("invalid media path")
@@ -693,6 +687,7 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 		}
 
 		// Parse the request body
+		r.Body = http.MaxBytesReader(w, r.Body, maxRequestBody)
 		var req SendMessageRequest
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			http.Error(w, "Invalid request format", http.StatusBadRequest)
@@ -710,11 +705,16 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 			return
 		}
 
-		// WA_MEDIA_DIR confines media_path to one directory (never the session store)
-		mediaPath, err := resolveMediaPath(req.MediaPath, os.Getenv("WA_MEDIA_DIR"), "store")
-		if req.MediaPath != "" && err != nil {
-			http.Error(w, "Invalid media path", http.StatusBadRequest)
-			return
+		// media_path must lie inside WA_MEDIA_DIR (never the session store); unset fails closed
+		var mediaPath string
+		var mediaData []byte
+		if req.MediaPath != "" {
+			var err error
+			mediaData, mediaPath, err = readMediaFile(req.MediaPath, os.Getenv("WA_MEDIA_DIR"), "store")
+			if err != nil {
+				http.Error(w, "Invalid media path", http.StatusBadRequest)
+				return
+			}
 		}
 
 		// Never log message content: only a truncated recipient and the length
@@ -722,7 +722,7 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 			lastChars(req.Recipient, 4), len(req.Message), req.MediaPath != "")
 
 		// Send the message
-		success, message := sendWhatsAppMessage(client, req.Recipient, req.Message, mediaPath)
+		success, message := sendWhatsAppMessage(client, req.Recipient, req.Message, mediaPath, mediaData)
 		fmt.Printf("Message sent to ...%s: %t\n", lastChars(req.Recipient, 4), success)
 		// Set response headers
 		w.Header().Set("Content-Type", "application/json")
@@ -748,6 +748,7 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 		}
 
 		// Parse the request body
+		r.Body = http.MaxBytesReader(w, r.Body, maxRequestBody)
 		var req DownloadMediaRequest
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			http.Error(w, "Invalid request format", http.StatusBadRequest)
@@ -770,17 +771,13 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 		// Set response headers
 		w.Header().Set("Content-Type", "application/json")
 
-		// Handle download result
+		// Handle download result; details go to the log only, never to the client
 		if !success || err != nil {
-			errMsg := "Unknown error"
-			if err != nil {
-				errMsg = err.Error()
-			}
-
+			fmt.Printf("Media download failed: %v\n", err)
 			w.WriteHeader(http.StatusInternalServerError)
 			json.NewEncoder(w).Encode(DownloadMediaResponse{
 				Success: false,
-				Message: fmt.Sprintf("Failed to download media: %s", errMsg),
+				Message: "Failed to download media",
 			})
 			return
 		}
@@ -798,12 +795,13 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 	if readDB, err := openReadOnlyDB("store/messages.db"); err != nil {
 		fmt.Printf("Read API disabled: %v\n", err)
 	} else {
-		resolveSender := func(sender string) string {
+		readDB.SetMaxOpenConns(2)
+		resolveSender := func(ctx context.Context, sender string) string {
 			// Best-effort LID -> phone number using the whatsmeow store
 			if client.Store == nil || client.Store.LIDs == nil {
 				return ""
 			}
-			pn, err := client.Store.LIDs.GetPNForLID(context.Background(), types.NewJID(sender, types.HiddenUserServer))
+			pn, err := client.Store.LIDs.GetPNForLID(ctx, types.NewJID(sender, types.HiddenUserServer))
 			if err != nil || pn.IsEmpty() {
 				return ""
 			}
@@ -825,7 +823,14 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 
 	// Run server in a goroutine so it doesn't block
 	go func() {
-		if err := http.ListenAndServe(serverAddr, nil); err != nil {
+		server := &http.Server{
+			Addr:              serverAddr,
+			ReadHeaderTimeout: 5 * time.Second,
+			ReadTimeout:       15 * time.Second,
+			WriteTimeout:      60 * time.Second,
+			IdleTimeout:       60 * time.Second,
+		}
+		if err := server.ListenAndServe(); err != nil {
 			fmt.Printf("REST API server error: %v\n", err)
 		}
 	}()

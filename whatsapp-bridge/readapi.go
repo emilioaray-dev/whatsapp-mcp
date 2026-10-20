@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"net/http"
@@ -14,9 +15,15 @@ import (
 
 const maxQueryLen = 256
 
+// queryTimeout bounds every read query.
+const queryTimeout = 5 * time.Second
+
+// SenderResolver maps a stored sender to a display value (best-effort, "" when unknown).
+type SenderResolver func(ctx context.Context, sender string) string
+
 // openReadOnlyDB opens a separate read-only connection to the message database.
 func openReadOnlyDB(path string) (*sql.DB, error) {
-	return sql.Open("sqlite3", "file:"+path+"?mode=ro&_foreign_keys=on")
+	return sql.Open("sqlite3", "file:"+path+"?mode=ro&_foreign_keys=on&_query_only=1")
 }
 
 // ChatResult is a chat as returned by GET /api/chats.
@@ -84,7 +91,9 @@ func chatsHandler(db *sql.DB) http.HandlerFunc {
 		}
 		limit := parseLimit(q.Get("limit"), 20, 100)
 		pattern := likePattern(query)
-		rows, err := db.Query(
+		ctx, cancel := context.WithTimeout(r.Context(), queryTimeout)
+		defer cancel()
+		rows, err := db.QueryContext(ctx,
 			`SELECT jid, name, last_message_time FROM chats
 			WHERE ? = '' OR name LIKE ? ESCAPE '\' OR jid LIKE ? ESCAPE '\'
 			ORDER BY last_message_time DESC LIMIT ?`,
@@ -120,9 +129,11 @@ func chatsHandler(db *sql.DB) http.HandlerFunc {
 
 const messageColumns = `id, chat_jid, sender, content, timestamp, is_from_me, media_type, filename`
 
-func scanMessages(rows *sql.Rows, resolveSender func(string) string) ([]MessageResult, error) {
+func scanMessages(ctx context.Context, rows *sql.Rows, resolveSender SenderResolver) ([]MessageResult, error) {
 	defer rows.Close()
 	msgs := []MessageResult{}
+	// One lookup per distinct sender per request
+	names := map[string]string{}
 	for rows.Next() {
 		var m MessageResult
 		var sender, content, mediaType, filename sql.NullString
@@ -137,14 +148,19 @@ func scanMessages(rows *sql.Rows, resolveSender func(string) string) ([]MessageR
 			m.Timestamp = &ts.Time
 		}
 		if resolveSender != nil && m.Sender != "" {
-			m.SenderName = resolveSender(m.Sender)
+			name, ok := names[m.Sender]
+			if !ok {
+				name = resolveSender(ctx, m.Sender)
+				names[m.Sender] = name
+			}
+			m.SenderName = name
 		}
 		msgs = append(msgs, m)
 	}
 	return msgs, rows.Err()
 }
 
-func messagesHandler(db *sql.DB, resolveSender func(string) string) http.HandlerFunc {
+func messagesHandler(db *sql.DB, resolveSender SenderResolver) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if !onlyGET(w, r) {
 			return
@@ -170,9 +186,11 @@ func messagesHandler(db *sql.DB, resolveSender func(string) string) http.Handler
 				http.Error(w, "Invalid before (RFC3339 expected)", http.StatusBadRequest)
 				return
 			}
-			// Timestamps are stored in local time by the sqlite driver; compare in the same zone.
-			sqlText += ` AND timestamp < ?`
-			args = append(args, before.In(time.Local))
+			// go-sqlite3 stores time.Time as text "2006-01-02 15:04:05.999999999-07:00" in the zone
+			// of the value written (time.Local when written). julianday() normalises the offset, so
+			// the comparison is correct whatever TZ was in effect at write time.
+			sqlText += ` AND julianday(timestamp) < julianday(?)`
+			args = append(args, before.UTC().Format("2006-01-02 15:04:05.999999999-07:00"))
 		}
 		if text != "" {
 			sqlText += ` AND content LIKE ? ESCAPE '\'`
@@ -181,12 +199,14 @@ func messagesHandler(db *sql.DB, resolveSender func(string) string) http.Handler
 		sqlText += ` ORDER BY timestamp DESC LIMIT ?`
 		args = append(args, limit)
 
-		rows, err := db.Query(sqlText, args...)
+		ctx, cancel := context.WithTimeout(r.Context(), queryTimeout)
+		defer cancel()
+		rows, err := db.QueryContext(ctx, sqlText, args...)
 		if err != nil {
 			http.Error(w, "Internal error", http.StatusInternalServerError)
 			return
 		}
-		msgs, err := scanMessages(rows, resolveSender)
+		msgs, err := scanMessages(ctx, rows, resolveSender)
 		if err != nil {
 			http.Error(w, "Internal error", http.StatusInternalServerError)
 			return
@@ -195,7 +215,7 @@ func messagesHandler(db *sql.DB, resolveSender func(string) string) http.Handler
 	}
 }
 
-func searchHandler(db *sql.DB, resolveSender func(string) string) http.HandlerFunc {
+func searchHandler(db *sql.DB, resolveSender SenderResolver) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if !onlyGET(w, r) {
 			return
@@ -207,7 +227,9 @@ func searchHandler(db *sql.DB, resolveSender func(string) string) http.HandlerFu
 			return
 		}
 		limit := parseLimit(q.Get("limit"), 20, 100)
-		rows, err := db.Query(
+		ctx, cancel := context.WithTimeout(r.Context(), queryTimeout)
+		defer cancel()
+		rows, err := db.QueryContext(ctx,
 			`SELECT `+messageColumns+` FROM messages WHERE content LIKE ? ESCAPE '\' ORDER BY timestamp DESC LIMIT ?`,
 			likePattern(text), limit,
 		)
@@ -215,7 +237,7 @@ func searchHandler(db *sql.DB, resolveSender func(string) string) http.HandlerFu
 			http.Error(w, "Internal error", http.StatusInternalServerError)
 			return
 		}
-		msgs, err := scanMessages(rows, resolveSender)
+		msgs, err := scanMessages(ctx, rows, resolveSender)
 		if err != nil {
 			http.Error(w, "Internal error", http.StatusInternalServerError)
 			return

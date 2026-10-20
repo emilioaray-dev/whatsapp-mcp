@@ -2,11 +2,16 @@ package main
 
 import (
 	"errors"
+	"io"
 	"os"
 	"path/filepath"
 	"regexp"
 	"strings"
+	"syscall"
 )
+
+// maxRequestBody caps JSON request bodies of the write endpoints.
+const maxRequestBody = 64 << 10
 
 // chatJIDPattern restricts chat JIDs to the characters WhatsApp actually uses.
 var chatJIDPattern = regexp.MustCompile(`^[0-9A-Za-z._:@+-]+$`)
@@ -39,6 +44,16 @@ func fallbackFilename(messageID string) string {
 	return "media_" + unsafeNameChars.ReplaceAllString(messageID, "_")
 }
 
+// mediaFilename is the on-disk name of a message's media: "<id>_<safe name>". The ID prefix keeps
+// two messages that share a sender-chosen filename (or a planted file) from ever colliding.
+func mediaFilename(messageID, name string) string {
+	safe := safeFilename(name)
+	if safe == "" {
+		return fallbackFilename(messageID)
+	}
+	return unsafeNameChars.ReplaceAllString(messageID, "_") + "_" + safe
+}
+
 // isWithin reports whether target is base itself or lies below it. Both must be clean absolute
 // or both clean relative paths.
 func isWithin(base, target string) bool {
@@ -68,12 +83,11 @@ func storeMediaPath(storeDir, chatJID, filename string) (string, string, error) 
 	return chatDir, localPath, nil
 }
 
-// resolveMediaPath enforces WA_MEDIA_DIR for /api/send. With mediaDir empty the legacy behaviour
-// (any path) is kept. Otherwise the fully resolved path must be a regular file inside mediaDir
-// and outside storeDir; the resolved path is returned so the caller reads what was checked.
+// resolveMediaPath enforces WA_MEDIA_DIR for /api/send. With mediaDir empty it fails closed.
+// The fully resolved path must be a regular file inside mediaDir and never inside storeDir.
 func resolveMediaPath(mediaPath, mediaDir, storeDir string) (string, error) {
-	if mediaDir == "" {
-		return mediaPath, nil
+	if mediaDir == "" || mediaPath == "" || strings.ContainsRune(mediaPath, 0) {
+		return "", errInvalidPath
 	}
 	realPath, err := realAbs(mediaPath)
 	if err != nil {
@@ -98,4 +112,40 @@ func realAbs(p string) (string, error) {
 		return "", err
 	}
 	return filepath.EvalSymlinks(abs)
+}
+
+// readMediaFile validates mediaPath with resolveMediaPath and then reads it through an os.Root
+// anchored at mediaDir with O_NOFOLLOW, re-checking the opened descriptor, so a path swapped
+// after validation cannot make it read anything outside mediaDir.
+func readMediaFile(mediaPath, mediaDir, storeDir string) ([]byte, string, error) {
+	realPath, err := resolveMediaPath(mediaPath, mediaDir, storeDir)
+	if err != nil {
+		return nil, "", err
+	}
+	realBase, err := realAbs(mediaDir)
+	if err != nil {
+		return nil, "", errInvalidPath
+	}
+	rel, err := filepath.Rel(realBase, realPath)
+	if err != nil {
+		return nil, "", errInvalidPath
+	}
+	root, err := os.OpenRoot(realBase)
+	if err != nil {
+		return nil, "", errInvalidPath
+	}
+	defer root.Close()
+	f, err := root.OpenFile(rel, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
+	if err != nil {
+		return nil, "", errInvalidPath
+	}
+	defer f.Close()
+	if info, err := f.Stat(); err != nil || !info.Mode().IsRegular() {
+		return nil, "", errInvalidPath
+	}
+	data, err := io.ReadAll(f)
+	if err != nil {
+		return nil, "", errInvalidPath
+	}
+	return data, realPath, nil
 }

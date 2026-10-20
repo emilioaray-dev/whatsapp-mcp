@@ -12,11 +12,14 @@ RUN apt-get update \
  && apt-get install -y --no-install-recommends ca-certificates tzdata \
  && rm -rf /var/lib/apt/lists/* \
  && groupadd -g 10001 wa && useradd -u 10001 -g 10001 -d /data -s /usr/sbin/nologin wa \
- && mkdir -p /data && chown 10001:10001 /data
+ && mkdir -p /data/outbox && chown -R 10001:10001 /data
 COPY --from=build /out/whatsapp-bridge /usr/local/bin/whatsapp-bridge
 USER 10001:10001
 WORKDIR /data
 # El bridge escribe `store/` relativo al cwd; la API REST no tiene autenticación: en el pod se
 # bindea a loopback (WA_BRIDGE_ADDR) detrás del gateway.
 ENV WA_BRIDGE_ADDR=127.0.0.1:8080
+# media_path de /api/send solo se acepta dentro de este directorio (sin la variable, falla cerrado).
+# TZ fija la zona en que se guardan los timestamps de messages.db.
+ENV WA_MEDIA_DIR=/data/outbox TZ=UTC
 ENTRYPOINT ["/usr/local/bin/whatsapp-bridge"]

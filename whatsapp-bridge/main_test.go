@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"net/http"
@@ -71,6 +72,33 @@ func TestStoreMediaPath(t *testing.T) {
 	}
 }
 
+func TestMediaFilenameNoCollision(t *testing.T) {
+	storeDir := t.TempDir()
+	jid := "x@s.whatsapp.net"
+	// A sender plants "factura.pdf" in the chat directory
+	planted := filepath.Join(storeDir, jid, "factura.pdf")
+	if err := os.MkdirAll(filepath.Dir(planted), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(planted, []byte("evil"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	_, p1, err1 := storeMediaPath(storeDir, jid, mediaFilename("ID1", "factura.pdf"))
+	_, p2, err2 := storeMediaPath(storeDir, jid, mediaFilename("ID2", "../factura.pdf"))
+	if err1 != nil || err2 != nil {
+		t.Fatal(err1, err2)
+	}
+	if p1 == p2 || p1 == planted || p2 == planted {
+		t.Errorf("paths collide: %q %q planted=%q", p1, p2, planted)
+	}
+	if got := mediaFilename("3EB0/..", "a.jpg"); got != "3EB0____a.jpg" {
+		t.Errorf("mediaFilename = %q", got)
+	}
+	if got := mediaFilename("ID", ".."); got != "media_ID" {
+		t.Errorf("mediaFilename fallback = %q", got)
+	}
+}
+
 func TestResolveMediaPath(t *testing.T) {
 	root := t.TempDir()
 	media := filepath.Join(root, "media")
@@ -97,8 +125,22 @@ func TestResolveMediaPath(t *testing.T) {
 	}
 
 	// Legacy behaviour when WA_MEDIA_DIR is unset
-	if got, err := resolveMediaPath(secret, "", store); err != nil || got != secret {
-		t.Errorf("legacy: %q %v", got, err)
+	// Without WA_MEDIA_DIR every media_path fails closed
+	for _, p := range []string{secret, inside, filepath.Join(store, "whatsapp.db")} {
+		if _, err := resolveMediaPath(p, "", store); err == nil {
+			t.Errorf("unset WA_MEDIA_DIR accepted %s", p)
+		}
+		if _, _, err := readMediaFile(p, "", store); err == nil {
+			t.Errorf("readMediaFile with unset WA_MEDIA_DIR accepted %s", p)
+		}
+	}
+	if data, got, err := readMediaFile(inside, media, store); err != nil || string(data) != "x" || got == "" {
+		t.Errorf("readMediaFile inside: %q %q %v", data, got, err)
+	}
+	for _, p := range []string{link, secret, filepath.Join(store, "whatsapp.db"), inside + "\x00.jpg"} {
+		if _, _, err := readMediaFile(p, media, store); err == nil {
+			t.Errorf("readMediaFile accepted %q", p)
+		}
 	}
 	if _, err := resolveMediaPath(inside, media, store); err != nil {
 		t.Errorf("inside rejected: %v", err)
@@ -110,6 +152,7 @@ func TestResolveMediaPath(t *testing.T) {
 		"store":     filepath.Join(store, "whatsapp.db"),
 		"dir":       media,
 		"missing":   filepath.Join(media, "nope"),
+		"nul":       inside + "\x00",
 	} {
 		if _, err := resolveMediaPath(p, media, store); err == nil {
 			t.Errorf("%s accepted: %s", name, p)
@@ -140,6 +183,17 @@ func newTestDB(t *testing.T) *sql.DB {
 	if _, err := rw.Exec(`INSERT INTO chats VALUES (?, ?, ?), (?, ?, ?)`,
 		jid, "Alice", base, "222@g.us", "Group_X", base.Add(-time.Hour)); err != nil {
 		t.Fatal(err)
+	}
+	// tz1 is 09:00Z stored as 11:00+02:00; tz2 is 10:00Z stored as 10:00Z
+	plus2 := time.FixedZone("x", 2*3600)
+	for id, ts := range map[string]time.Time{
+		"tz1": time.Date(2026, 1, 1, 11, 0, 0, 0, plus2),
+		"tz2": time.Date(2026, 1, 1, 10, 0, 0, 0, time.UTC),
+	} {
+		if _, err := rw.Exec(`INSERT INTO messages (id, chat_jid, sender, content, timestamp, is_from_me) VALUES (?,?,?,?,?,?)`,
+			id, "222@g.us", "1", "tz", ts, false); err != nil {
+			t.Fatal(err)
+		}
 	}
 	contents := []string{"50% off", "500 off", "hello", "under_score", "underXscore"}
 	for i := 0; i < 250; i++ {
@@ -179,7 +233,8 @@ func get(t *testing.T, h http.HandlerFunc, method, url string, out interface{}) 
 
 func TestReadHandlers(t *testing.T) {
 	db := newTestDB(t)
-	msgs := messagesHandler(db, func(s string) string { return "+" + s })
+	calls := 0
+	msgs := messagesHandler(db, func(_ context.Context, s string) string { calls++; return "+" + s })
 	search := searchHandler(db, nil)
 	chats := chatsHandler(db)
 
@@ -189,6 +244,9 @@ func TestReadHandlers(t *testing.T) {
 	}
 	if ms[0].ID != "maaa" || ms[0].SenderName != "+999" || !ms[0].IsFromMe {
 		t.Errorf("first message: %+v", ms[0])
+	}
+	if calls != 1 {
+		t.Errorf("sender resolver called %d times for one distinct sender", calls)
 	}
 	if code := get(t, msgs, "GET", "/api/messages?chat_jid=111@s.whatsapp.net", &ms); code != 200 || len(ms) != 20 {
 		t.Errorf("default limit: %d %d", code, len(ms))
@@ -246,5 +304,18 @@ func TestReadHandlers(t *testing.T) {
 	// The connection is read-only
 	if _, err := db.Exec(`DELETE FROM messages`); err == nil {
 		t.Error("read-only connection accepted a write")
+	}
+	if _, err := db.Exec(`INSERT INTO chats VALUES ('z@g.us', 'z', NULL)`); err == nil {
+		t.Error("read-only connection accepted an INSERT")
+	}
+	var qo int
+	if err := db.QueryRow(`PRAGMA query_only`).Scan(&qo); err != nil || qo != 1 {
+		t.Errorf("query_only = %d %v", qo, err)
+	}
+
+	// before compares instants, not text: a row stored with a +02:00 offset is still ordered
+	// correctly against a UTC cutoff
+	if code := get(t, msgs, "GET", "/api/messages?chat_jid=222@g.us&before=2026-01-01T09:30:00Z", &ms); code != 200 || len(ms) != 1 || ms[0].ID != "tz1" {
+		t.Errorf("before across zones: %d %+v", code, ms)
 	}
 }
