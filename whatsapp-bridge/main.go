@@ -49,7 +49,7 @@ type MessageStore struct {
 // Initialize message store
 func NewMessageStore() (*MessageStore, error) {
 	// Create directory for database if it doesn't exist
-	if err := os.MkdirAll("store", 0755); err != nil {
+	if err := os.MkdirAll("store", 0700); err != nil {
 		return nil, fmt.Errorf("failed to create store directory: %v", err)
 	}
 
@@ -288,7 +288,7 @@ func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message str
 			return false, fmt.Sprintf("Error uploading media: %v", err)
 		}
 
-		fmt.Println("Media uploaded", resp)
+		fmt.Println("Media uploaded")
 
 		// Create the appropriate message type based on media type
 		switch mediaType {
@@ -463,9 +463,9 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 
 		// Log based on message type
 		if mediaType != "" {
-			fmt.Printf("[%s] %s %s: [%s: %s] %s\n", timestamp, direction, sender, mediaType, filename, content)
+			fmt.Printf("[%s] %s ...%s: [%s] (%d chars)\n", timestamp, direction, lastChars(sender, 4), mediaType, len(content))
 		} else if content != "" {
-			fmt.Printf("[%s] %s %s: %s\n", timestamp, direction, sender, content)
+			fmt.Printf("[%s] %s ...%s: (%d chars)\n", timestamp, direction, lastChars(sender, 4), len(content))
 		}
 	}
 }
@@ -561,9 +561,10 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 	var fileLength uint64
 	var err error
 
-	// First, check if we already have this file
-	chatDir := fmt.Sprintf("store/%s", strings.ReplaceAll(chatJID, ":", "_"))
-	localPath := ""
+	// chat_jid comes from the client and is used to build a filesystem path
+	if !validChatJID(chatJID) {
+		return false, "", "", "", fmt.Errorf("invalid chat JID")
+	}
 
 	// Get media info from the database
 	mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength, err = messageStore.GetMediaInfo(messageID, chatJID)
@@ -585,13 +586,19 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 		return false, "", "", "", fmt.Errorf("not a media message")
 	}
 
-	// Create directory for the chat if it doesn't exist
-	if err := os.MkdirAll(chatDir, 0755); err != nil {
-		return false, "", "", "", fmt.Errorf("failed to create chat directory: %v", err)
+	// The filename is chosen by whoever sent the media: reduce it to one safe path component
+	if filename = safeFilename(filename); filename == "" {
+		filename = fallbackFilename(messageID)
+	}
+	chatDir, localPath, err := storeMediaPath("store", chatJID, filename)
+	if err != nil {
+		return false, "", "", "", fmt.Errorf("invalid media path")
 	}
 
-	// Generate a local path for the file
-	localPath = fmt.Sprintf("%s/%s", chatDir, filename)
+	// Create directory for the chat if it doesn't exist
+	if err := os.MkdirAll(chatDir, 0700); err != nil {
+		return false, "", "", "", fmt.Errorf("failed to create chat directory: %v", err)
+	}
 
 	// Get absolute path
 	absPath, err := filepath.Abs(localPath)
@@ -647,7 +654,7 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 	}
 
 	// Save the downloaded media to file
-	if err := os.WriteFile(localPath, mediaData, 0644); err != nil {
+	if err := os.WriteFile(localPath, mediaData, 0600); err != nil {
 		return false, "", "", "", fmt.Errorf("failed to save media file: %v", err)
 	}
 
@@ -703,11 +710,20 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 			return
 		}
 
-		fmt.Println("Received request to send message", req.Message, req.MediaPath)
+		// WA_MEDIA_DIR confines media_path to one directory (never the session store)
+		mediaPath, err := resolveMediaPath(req.MediaPath, os.Getenv("WA_MEDIA_DIR"), "store")
+		if req.MediaPath != "" && err != nil {
+			http.Error(w, "Invalid media path", http.StatusBadRequest)
+			return
+		}
+
+		// Never log message content: only a truncated recipient and the length
+		fmt.Printf("Received request to send message to ...%s (%d chars, media=%t)\n",
+			lastChars(req.Recipient, 4), len(req.Message), req.MediaPath != "")
 
 		// Send the message
-		success, message := sendWhatsAppMessage(client, req.Recipient, req.Message, req.MediaPath)
-		fmt.Println("Message sent", success, message)
+		success, message := sendWhatsAppMessage(client, req.Recipient, req.Message, mediaPath)
+		fmt.Printf("Message sent to ...%s: %t\n", lastChars(req.Recipient, 4), success)
 		// Set response headers
 		w.Header().Set("Content-Type", "application/json")
 
@@ -743,6 +759,10 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 			http.Error(w, "Message ID and Chat JID are required", http.StatusBadRequest)
 			return
 		}
+		if !validChatJID(req.ChatJID) {
+			http.Error(w, "Invalid chat JID", http.StatusBadRequest)
+			return
+		}
 
 		// Download the media
 		success, mediaType, filename, path, err := downloadMedia(client, messageStore, req.MessageID, req.ChatJID)
@@ -774,6 +794,26 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 		})
 	})
 
+	// Read-only endpoints use their own read-only connection to messages.db only
+	if readDB, err := openReadOnlyDB("store/messages.db"); err != nil {
+		fmt.Printf("Read API disabled: %v\n", err)
+	} else {
+		resolveSender := func(sender string) string {
+			// Best-effort LID -> phone number using the whatsmeow store
+			if client.Store == nil || client.Store.LIDs == nil {
+				return ""
+			}
+			pn, err := client.Store.LIDs.GetPNForLID(context.Background(), types.NewJID(sender, types.HiddenUserServer))
+			if err != nil || pn.IsEmpty() {
+				return ""
+			}
+			return pn.User
+		}
+		http.HandleFunc("/api/chats", chatsHandler(readDB))
+		http.HandleFunc("/api/messages", messagesHandler(readDB, resolveSender))
+		http.HandleFunc("/api/search", searchHandler(readDB, resolveSender))
+	}
+
 	// Start the server
 	serverAddr := fmt.Sprintf(":%d", port)
 	// WA_BRIDGE_ADDR lets a deployment bind the unauthenticated REST API to loopback
@@ -800,7 +840,7 @@ func main() {
 	dbLog := waLog.Stdout("Database", "INFO", true)
 
 	// Create directory for database if it doesn't exist
-	if err := os.MkdirAll("store", 0755); err != nil {
+	if err := os.MkdirAll("store", 0700); err != nil {
 		logger.Errorf("Failed to create store directory: %v", err)
 		return
 	}
@@ -1350,4 +1390,12 @@ func placeholderWaveform(duration uint32) []byte {
 	}
 
 	return waveform
+}
+
+// lastChars returns at most the last n characters of s, for log redaction.
+func lastChars(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	return s[len(s)-n:]
 }
