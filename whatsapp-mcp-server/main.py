@@ -14,6 +14,12 @@ from whatsapp import (
     send_audio_message as whatsapp_audio_voice_message,
     download_media as whatsapp_download_media
 )
+from service_client import (
+    NOT_AVAILABLE,
+    NOT_AVAILABLE_FILES,
+    ServiceError,
+    get_service_client,
+)
 
 # Initialize FastMCP server
 mcp = FastMCP("whatsapp")
@@ -25,6 +31,9 @@ def search_contacts(query: str) -> List[Dict[str, Any]]:
     Args:
         query: Search term to match against contact names or phone numbers
     """
+    svc = get_service_client()
+    if svc:
+        return svc.search_contacts(query)
     contacts = whatsapp_search_contacts(query)
     return contacts
 
@@ -54,7 +63,13 @@ def list_messages(
         include_context: Whether to include messages before and after matches (default True)
         context_before: Number of messages to include before each match (default 1)
         context_after: Number of messages to include after each match (default 1)
+
+    In service mode only chat_jid, before, query and limit are applied (without chat_jid, query
+    searches all chats).
     """
+    svc = get_service_client()
+    if svc:
+        return svc.list_messages(chat_jid=chat_jid, before=before, query=query, limit=limit)
     messages = whatsapp_list_messages(
         after=after,
         before=before,
@@ -85,7 +100,12 @@ def list_chats(
         page: Page number for pagination (default 0)
         include_last_message: Whether to include the last message in each chat (default True)
         sort_by: Field to sort results by, either "last_active" or "name" (default "last_active")
+
+    In service mode only query and limit are applied.
     """
+    svc = get_service_client()
+    if svc:
+        return svc.list_chats(query=query, limit=limit)
     chats = whatsapp_list_chats(
         query=query,
         limit=limit,
@@ -96,6 +116,24 @@ def list_chats(
     return chats
 
 @mcp.tool()
+def search_messages(query: str, limit: int = 20) -> List[Dict[str, Any]]:
+    """Search message text across all WhatsApp chats (newest first).
+
+    Args:
+        query: Text to search for in message content
+        limit: Maximum number of messages to return (default 20, max 100)
+    """
+    svc = get_service_client()
+    if svc:
+        return svc.search_messages(query, limit)
+    return whatsapp_list_messages(query=query, limit=limit, include_context=False)
+
+def _local_only() -> None:
+    """Raise in service mode for tools that need the local database."""
+    if get_service_client():
+        raise ServiceError(NOT_AVAILABLE)
+
+@mcp.tool()
 def get_chat(chat_jid: str, include_last_message: bool = True) -> Dict[str, Any]:
     """Get WhatsApp chat metadata by JID.
     
@@ -103,6 +141,7 @@ def get_chat(chat_jid: str, include_last_message: bool = True) -> Dict[str, Any]
         chat_jid: The JID of the chat to retrieve
         include_last_message: Whether to include the last message (default True)
     """
+    _local_only()
     chat = whatsapp_get_chat(chat_jid, include_last_message)
     return chat
 
@@ -113,6 +152,7 @@ def get_direct_chat_by_contact(sender_phone_number: str) -> Dict[str, Any]:
     Args:
         sender_phone_number: The phone number to search for
     """
+    _local_only()
     chat = whatsapp_get_direct_chat_by_contact(sender_phone_number)
     return chat
 
@@ -125,6 +165,7 @@ def get_contact_chats(jid: str, limit: int = 20, page: int = 0) -> List[Dict[str
         limit: Maximum number of chats to return (default 20)
         page: Page number for pagination (default 0)
     """
+    _local_only()
     chats = whatsapp_get_contact_chats(jid, limit, page)
     return chats
 
@@ -135,6 +176,7 @@ def get_last_interaction(jid: str) -> str:
     Args:
         jid: The JID of the contact to search for
     """
+    _local_only()
     message = whatsapp_get_last_interaction(jid)
     return message
 
@@ -151,6 +193,7 @@ def get_message_context(
         before: Number of messages to include before the target message (default 5)
         after: Number of messages to include after the target message (default 5)
     """
+    _local_only()
     context = whatsapp_get_message_context(message_id, before, after)
     return context
 
@@ -176,6 +219,11 @@ def send_message(
             "message": "Recipient must be provided"
         }
     
+    svc = get_service_client()
+    if svc:
+        success, status_message = svc.send_message(recipient, message)
+        return {"success": success, "message": status_message}
+
     # Call the whatsapp_send_message function with the unified recipient parameter
     success, status_message = whatsapp_send_message(recipient, message)
     return {
@@ -195,7 +243,9 @@ def send_file(recipient: str, media_path: str) -> Dict[str, Any]:
     Returns:
         A dictionary containing success status and a status message
     """
-    
+    if get_service_client():
+        return {"success": False, "message": NOT_AVAILABLE_FILES}
+
     # Call the whatsapp_send_file function
     success, status_message = whatsapp_send_file(recipient, media_path)
     return {
@@ -215,6 +265,8 @@ def send_audio_message(recipient: str, media_path: str) -> Dict[str, Any]:
     Returns:
         A dictionary containing success status and a status message
     """
+    if get_service_client():
+        return {"success": False, "message": NOT_AVAILABLE_FILES}
     success, status_message = whatsapp_audio_voice_message(recipient, media_path)
     return {
         "success": success,
@@ -232,6 +284,9 @@ def download_media(message_id: str, chat_jid: str) -> Dict[str, Any]:
     Returns:
         A dictionary containing success status, a status message, and the file path if successful
     """
+    svc = get_service_client()
+    if svc:
+        return svc.download_media(message_id, chat_jid)
     file_path = whatsapp_download_media(message_id, chat_jid)
     
     if file_path:
