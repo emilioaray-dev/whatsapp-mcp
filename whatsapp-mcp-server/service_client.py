@@ -38,7 +38,7 @@ def validate_base_url(url: str) -> str:
     """Return the normalised base URL or raise ServiceError."""
     url = url.rstrip("/")
     parts = urlsplit(url)
-    if parts.username or parts.password or parts.query or parts.fragment:
+    if "?" in url or "#" in url or "@" in parts.netloc or parts.path not in ("", "/"):
         raise ServiceError("WA_SERVICE_URL must be a plain base URL")
     if parts.scheme == "https" and parts.hostname:
         return url
@@ -110,7 +110,7 @@ class ServiceClient:
         return [
             {"phone_number": c["jid"].split("@")[0], "name": c.get("name"), "jid": c["jid"]}
             for c in chats
-            if not c.get("jid", "").endswith("@g.us")
+            if isinstance(c.get("jid"), str) and c["jid"] and not c["jid"].endswith("@g.us")
         ]
 
     # Write operations (results keep the legacy tool shapes)

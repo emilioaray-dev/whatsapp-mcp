@@ -37,6 +37,8 @@ class FakeService:
         self.requests = []
         self.status = 200
         self.body = None
+        self.raw_body = None
+        self.location = None
         outer = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -49,11 +51,15 @@ class FakeService:
                     "query": parse_qs(parts.query), "headers": dict(self.headers),
                     "json": json.loads(raw) if raw else None,
                 })
-                if outer.status != 200:
+                if outer.raw_body is not None:
+                    body = outer.raw_body
+                elif outer.status != 200:
                     body = f"upstream failure {TOKEN} {CF_SECRET}".encode()
                 else:
                     body = json.dumps(outer.body if outer.body is not None else self._default(parts.path)).encode()
                 self.send_response(outer.status)
+                if outer.location:
+                    self.send_header("Location", outer.location)
                 self.send_header("Content-Type", "application/json")
                 self.send_header("Content-Length", str(len(body)))
                 self.end_headers()
@@ -230,7 +236,10 @@ def test_missing_credentials_fail_clearly(monkeypatch):
     assert_no_secrets(str(e.value))
 
 
-@pytest.mark.parametrize("url", ["http://wa.example.com", "ftp://x", "https://user:pw@wa.example.com", "wa.example.com"])
+@pytest.mark.parametrize("url", ["http://wa.example.com", "ftp://x", "https://user:pw@wa.example.com", "wa.example.com",
+    "https://wa.example.com/api/send#", "https://wa.example.com?", "https://wa.example.com/?x=1",
+    "https://:@wa.example.com", "https://@wa.example.com", "https://wa.example.com/api",
+    "https://wa.example.com/../x"])
 def test_rejects_insecure_urls(monkeypatch, url):
     monkeypatch.setenv("WA_SERVICE_URL", url)
     with pytest.raises(service_client.ServiceError):
@@ -239,3 +248,39 @@ def test_rejects_insecure_urls(monkeypatch, url):
 
 def test_timeouts_are_explicit():
     assert service_client.TIMEOUT == (5, 20)
+
+
+def test_accepts_plain_base_urls():
+    assert service_client.validate_base_url("https://wa.example.com/") == "https://wa.example.com"
+    assert service_client.validate_base_url("http://localhost:8080") == "http://localhost:8080"
+
+
+def test_redirect_not_followed(svc):
+    other = FakeService()
+    try:
+        svc.status = 302
+        svc.location = other.url + "/api/send"
+        out = main.send_message("1", "x")
+        with pytest.raises(service_client.ServiceError) as e:
+            main.list_chats()
+        assert other.requests == []
+        assert out == {"success": False, "message": "service error: HTTP 302"}
+        assert_no_secrets(out, str(e.value))
+    finally:
+        other.close()
+
+
+def test_non_json_200_is_generic(svc):
+    svc.raw_body = f"<html>oops {TOKEN}</html>".encode()
+    with pytest.raises(service_client.ServiceError) as e:
+        main.list_chats()
+    assert str(e.value) == "service returned an invalid response"
+    out = main.send_message("1", "x")
+    assert out == {"success": False, "message": "service returned an invalid response"}
+    assert "oops" not in str(out)
+
+
+def test_search_contacts_skips_chats_without_jid(svc):
+    svc.body = [{"name": "NoJid"}, {"jid": None, "name": "Null"}, CHATS[0]]
+    assert main.search_contacts("a") == [
+        {"phone_number": "34600111222", "name": "Alice", "jid": "34600111222@s.whatsapp.net"}]
