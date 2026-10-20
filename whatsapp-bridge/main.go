@@ -6,6 +6,7 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
+	"log"
 	"math"
 	"math/rand"
 	"net/http"
@@ -582,15 +583,17 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 	}
 
 	// The filename is chosen by whoever sent the media: reduce it to one safe path component
-	// and prefix the message ID so a planted file can never be served for another message
-	filename = mediaFilename(messageID, filename)
-	chatDir, localPath, err := storeMediaPath("store", chatJID, filename)
+	// inside a per-message directory so no two messages can ever share a file
+	if filename = safeFilename(filename); filename == "" {
+		filename = "media"
+	}
+	msgDir, localPath, err := storeMediaPath("store", chatJID, messageID, filename)
 	if err != nil {
 		return false, "", "", "", fmt.Errorf("invalid media path")
 	}
 
-	// Create directory for the chat if it doesn't exist
-	if err := os.MkdirAll(chatDir, 0700); err != nil {
+	// Create directory for the message if it doesn't exist
+	if err := os.MkdirAll(msgDir, 0700); err != nil {
 		return false, "", "", "", fmt.Errorf("failed to create chat directory: %v", err)
 	}
 
@@ -600,9 +603,8 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 		return false, "", "", "", fmt.Errorf("failed to get absolute path: %v", err)
 	}
 
-	// Check if file already exists
-	if _, err := os.Stat(localPath); err == nil {
-		// File exists, return it
+	// Reuse an existing file only if its content matches the message's SHA-256
+	if fileMatchesSHA256(localPath, fileSHA256) {
 		return true, mediaType, filename, absPath, nil
 	}
 
@@ -848,6 +850,11 @@ func main() {
 	if err := os.MkdirAll("store", 0700); err != nil {
 		logger.Errorf("Failed to create store directory: %v", err)
 		return
+	}
+
+	// WA_MEDIA_DIR must never expose the session store to /api/send
+	if err := validateMediaDir(os.Getenv("WA_MEDIA_DIR"), "store"); err != nil {
+		log.Fatalf("Invalid WA_MEDIA_DIR: %v", err)
 	}
 
 	container, err := sqlstore.New(context.Background(), "sqlite3", "file:store/whatsapp.db?_foreign_keys=on", dbLog)

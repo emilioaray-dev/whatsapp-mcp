@@ -155,6 +155,19 @@ You can send various media types to your WhatsApp contacts:
   - With FFmpeg installed, the system will automatically convert other audio formats (MP3, WAV, etc.) to the required format.
   - Without FFmpeg, you can still send raw audio files using the `send_file` tool, but they won't appear as playable voice messages.
 
+#### Media Sending Directory (`WA_MEDIA_DIR`) — breaking change
+
+The bridge only sends files that live inside the directory named by the `WA_MEDIA_DIR`
+environment variable. **If `WA_MEDIA_DIR` is not set, every send with a `media_path` is rejected
+(HTTP 400)**; previously any file readable by the bridge could be sent. Text messages are
+unaffected.
+
+- Local bridge: create a folder (e.g. `mkdir ~/wa-outbox`), start the bridge with
+  `WA_MEDIA_DIR=~/wa-outbox go run main.go` and copy there anything you want to send.
+- Container image: `WA_MEDIA_DIR=/data/outbox` is preset.
+- The bridge refuses to start if `WA_MEDIA_DIR` is, contains or lies inside its `store/`
+  directory, and attachments larger than 100 MiB are rejected. There is no opt-out flag.
+
 #### Media Downloading
 
 By default, just the metadata of the media is stored in the local database. The message will indicate that media was sent. To access this media you need to use the download_media tool which takes the `message_id` and `chat_jid` (which are shown when printing messages containing the meda), this downloads the media and then returns the file path which can be then opened or passed to another tool.

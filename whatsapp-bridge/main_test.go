@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
 	"encoding/json"
 	"net/http"
@@ -30,9 +31,6 @@ func TestSafeFilename(t *testing.T) {
 			t.Errorf("safeFilename(%q) = %q, want %q", in, got, want)
 		}
 	}
-	if got := fallbackFilename("../AB/c"); got != "media____AB_c" {
-		t.Errorf("fallbackFilename = %q", got)
-	}
 }
 
 func TestValidChatJID(t *testing.T) {
@@ -54,48 +52,103 @@ func TestValidChatJID(t *testing.T) {
 }
 
 func TestStoreMediaPath(t *testing.T) {
-	dir, p, err := storeMediaPath("store", "1234:5@s.whatsapp.net", "a.jpg")
-	if err != nil || dir != filepath.Join("store", "1234_5@s.whatsapp.net") || p != filepath.Join(dir, "a.jpg") {
+	dir, p, err := storeMediaPath("store", "1234:5@s.whatsapp.net", "ID1", "a.jpg")
+	want := filepath.Join("store", "1234_5@s.whatsapp.net", messageDirName("ID1"))
+	if err != nil || dir != want || p != filepath.Join(want, "a.jpg") {
 		t.Fatalf("valid case: %q %q %v", dir, p, err)
 	}
-	bad := [][2]string{
-		{".", "whatsapp.db"},                   // would land in store/ root
-		{"..", "x"},                            // escapes store/
-		{"x@s.whatsapp.net", "../whatsapp.db"}, // unsanitized filename
-		{"x@s.whatsapp.net", ".."},
-		{"a/b", "x"},
+	bad := [][3]string{
+		{".", "ID", "whatsapp.db"},
+		{"..", "ID", "x"},
+		{"x@s.whatsapp.net", "ID", "../whatsapp.db"},
+		{"x@s.whatsapp.net", "ID", ".."},
+		{"x@s.whatsapp.net", "", "x"},
+		{"x@s.whatsapp.net", "ID", ""},
+		{"a/b", "ID", "x"},
 	}
 	for _, c := range bad {
-		if _, _, err := storeMediaPath("store", c[0], c[1]); err == nil {
-			t.Errorf("storeMediaPath(%q, %q) accepted", c[0], c[1])
+		if _, _, err := storeMediaPath("store", c[0], c[1], c[2]); err == nil {
+			t.Errorf("storeMediaPath(%q, %q, %q) accepted", c[0], c[1], c[2])
 		}
 	}
 }
 
-func TestMediaFilenameNoCollision(t *testing.T) {
-	storeDir := t.TempDir()
+func TestMediaPathNoCollision(t *testing.T) {
 	jid := "x@s.whatsapp.net"
-	// A sender plants "factura.pdf" in the chat directory
-	planted := filepath.Join(storeDir, jid, "factura.pdf")
-	if err := os.MkdirAll(filepath.Dir(planted), 0700); err != nil {
+	pairs := [][2][2]string{
+		{{"A", "B_x"}, {"A_B", "x"}},                     // '_' separator ambiguity
+		{{"A/B", "x"}, {"A.B", "x"}},                     // IDs differing only in sanitised chars
+		{{"ID1", "factura.pdf"}, {"ID2", "factura.pdf"}}, // same sender-chosen name
+	}
+	for _, pr := range pairs {
+		d1, p1, err1 := storeMediaPath("store", jid, pr[0][0], pr[0][1])
+		d2, p2, err2 := storeMediaPath("store", jid, pr[1][0], pr[1][1])
+		if err1 != nil || err2 != nil {
+			t.Fatal(err1, err2)
+		}
+		if p1 == p2 || d1 == d2 {
+			t.Errorf("%v collide: %q %q", pr, p1, p2)
+		}
+	}
+}
+
+func TestFileMatchesSHA256(t *testing.T) {
+	storeDir := t.TempDir()
+	dir, p, err := storeMediaPath(storeDir, "x@s.whatsapp.net", "ID1", "factura.pdf")
+	if err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(planted, []byte("evil"), 0600); err != nil {
+	os.MkdirAll(dir, 0700)
+	// A planted file with different content must not be reused
+	if err := os.WriteFile(p, []byte("evil"), 0600); err != nil {
 		t.Fatal(err)
 	}
-	_, p1, err1 := storeMediaPath(storeDir, jid, mediaFilename("ID1", "factura.pdf"))
-	_, p2, err2 := storeMediaPath(storeDir, jid, mediaFilename("ID2", "../factura.pdf"))
-	if err1 != nil || err2 != nil {
-		t.Fatal(err1, err2)
+	good := sha256.Sum256([]byte("legit"))
+	if fileMatchesSHA256(p, good[:]) {
+		t.Error("planted file with wrong SHA-256 reused")
 	}
-	if p1 == p2 || p1 == planted || p2 == planted {
-		t.Errorf("paths collide: %q %q planted=%q", p1, p2, planted)
+	os.WriteFile(p, []byte("legit"), 0600)
+	if !fileMatchesSHA256(p, good[:]) {
+		t.Error("matching file not reused")
 	}
-	if got := mediaFilename("3EB0/..", "a.jpg"); got != "3EB0____a.jpg" {
-		t.Errorf("mediaFilename = %q", got)
+	if fileMatchesSHA256(p, nil) || fileMatchesSHA256(p+"x", good[:]) {
+		t.Error("missing hash or file accepted")
 	}
-	if got := mediaFilename("ID", ".."); got != "media_ID" {
-		t.Errorf("mediaFilename fallback = %q", got)
+}
+
+func TestValidateMediaDir(t *testing.T) {
+	root := t.TempDir()
+	store := filepath.Join(root, "store")
+	outbox := filepath.Join(root, "outbox")
+	os.MkdirAll(store, 0700)
+	os.MkdirAll(outbox, 0700)
+	if err := validateMediaDir("", store); err != nil {
+		t.Errorf("unset: %v", err)
+	}
+	if err := validateMediaDir(outbox, store); err != nil {
+		t.Errorf("sibling rejected: %v", err)
+	}
+	for _, d := range []string{store, root, filepath.Join(store, "sub"), store + "/../store"} {
+		if err := validateMediaDir(d, store); err == nil {
+			t.Errorf("accepted %s", d)
+		}
+	}
+}
+
+func TestReadMediaFileSizeLimit(t *testing.T) {
+	media := t.TempDir()
+	store := t.TempDir()
+	p := filepath.Join(media, "big.bin")
+	os.WriteFile(p, make([]byte, 11), 0600)
+	old := maxMediaBytes
+	maxMediaBytes = 10
+	defer func() { maxMediaBytes = old }()
+	if _, _, err := readMediaFile(p, media, store); err != errMediaTooLarge {
+		t.Errorf("oversize: %v", err)
+	}
+	os.WriteFile(p, make([]byte, 10), 0600)
+	if _, _, err := readMediaFile(p, media, store); err != nil {
+		t.Errorf("at limit: %v", err)
 	}
 }
 

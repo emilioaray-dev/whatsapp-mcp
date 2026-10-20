@@ -1,7 +1,11 @@
 package main
 
 import (
+	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -13,11 +17,13 @@ import (
 // maxRequestBody caps JSON request bodies of the write endpoints.
 const maxRequestBody = 64 << 10
 
+// maxMediaBytes caps the size of an attachment read for /api/send (a var so tests can lower it).
+var maxMediaBytes int64 = 100 << 20
+
+var errMediaTooLarge = errors.New("media file exceeds size limit")
+
 // chatJIDPattern restricts chat JIDs to the characters WhatsApp actually uses.
 var chatJIDPattern = regexp.MustCompile(`^[0-9A-Za-z._:@+-]+$`)
-
-// unsafeNameChars matches anything we do not want in a fallback filename.
-var unsafeNameChars = regexp.MustCompile(`[^0-9A-Za-z_-]`)
 
 // errInvalidPath is returned for any path that fails validation. It is deliberately generic.
 var errInvalidPath = errors.New("invalid path")
@@ -39,19 +45,54 @@ func safeFilename(name string) string {
 	return base
 }
 
-// fallbackFilename derives a safe filename from a message ID.
-func fallbackFilename(messageID string) string {
-	return "media_" + unsafeNameChars.ReplaceAllString(messageID, "_")
+// messageDirName maps a sender-chosen message ID to a fixed-alphabet directory name. Distinct IDs
+// never share a directory, unlike any character-replacement scheme.
+func messageDirName(messageID string) string {
+	sum := sha256.Sum256([]byte(messageID))
+	return hex.EncodeToString(sum[:])
 }
 
-// mediaFilename is the on-disk name of a message's media: "<id>_<safe name>". The ID prefix keeps
-// two messages that share a sender-chosen filename (or a planted file) from ever colliding.
-func mediaFilename(messageID, name string) string {
-	safe := safeFilename(name)
-	if safe == "" {
-		return fallbackFilename(messageID)
+// fileMatchesSHA256 reports whether the file at path exists and hashes to want.
+func fileMatchesSHA256(path string, want []byte) bool {
+	if len(want) == 0 {
+		return false
 	}
-	return unsafeNameChars.ReplaceAllString(messageID, "_") + "_" + safe
+	f, err := os.Open(path)
+	if err != nil {
+		return false
+	}
+	defer f.Close()
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return false
+	}
+	return bytes.Equal(h.Sum(nil), want)
+}
+
+// validateMediaDir rejects a WA_MEDIA_DIR that is, contains or lies inside storeDir.
+func validateMediaDir(mediaDir, storeDir string) error {
+	if mediaDir == "" {
+		return nil
+	}
+	media, err := realOrAbs(mediaDir)
+	if err != nil {
+		return err
+	}
+	store, err := realOrAbs(storeDir)
+	if err != nil {
+		return err
+	}
+	if isWithin(media, store) || isWithin(store, media) {
+		return fmt.Errorf("%s overlaps the session store %s", media, store)
+	}
+	return nil
+}
+
+func realOrAbs(p string) (string, error) {
+	if r, err := realAbs(p); err == nil {
+		return r, nil
+	}
+	return filepath.Abs(p)
 }
 
 // isWithin reports whether target is base itself or lies below it. Both must be clean absolute
@@ -64,23 +105,23 @@ func isWithin(base, target string) bool {
 	return rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)) && !filepath.IsAbs(rel)
 }
 
-// storeMediaPath builds the directory and file path for a chat's media under storeDir and
-// verifies the result is exactly storeDir/<chat>/<file>, never anything else inside or outside it.
-func storeMediaPath(storeDir, chatJID, filename string) (string, string, error) {
-	if !validChatJID(chatJID) || safeFilename(filename) != filename {
+// storeMediaPath builds the directory and file path for a message's media under storeDir and
+// verifies the result is exactly storeDir/<chat>/<sha256(id)>/<file>, never anything else.
+func storeMediaPath(storeDir, chatJID, messageID, filename string) (string, string, error) {
+	if !validChatJID(chatJID) || messageID == "" || filename == "" || safeFilename(filename) != filename {
 		return "", "", errInvalidPath
 	}
-	chatDir := filepath.Join(storeDir, strings.ReplaceAll(chatJID, ":", "_"))
-	localPath := filepath.Clean(filepath.Join(chatDir, filename))
+	msgDir := filepath.Join(storeDir, strings.ReplaceAll(chatJID, ":", "_"), messageDirName(messageID))
+	localPath := filepath.Clean(filepath.Join(msgDir, filename))
 	rel, err := filepath.Rel(filepath.Clean(storeDir), localPath)
 	if err != nil {
 		return "", "", errInvalidPath
 	}
 	parts := strings.Split(rel, string(filepath.Separator))
-	if len(parts) != 2 || parts[0] == "." || parts[0] == ".." || parts[1] == ".." {
+	if len(parts) != 3 || parts[0] == "." || parts[0] == ".." || parts[2] == ".." {
 		return "", "", errInvalidPath
 	}
-	return chatDir, localPath, nil
+	return msgDir, localPath, nil
 }
 
 // resolveMediaPath enforces WA_MEDIA_DIR for /api/send. With mediaDir empty it fails closed.
@@ -143,9 +184,12 @@ func readMediaFile(mediaPath, mediaDir, storeDir string) ([]byte, string, error)
 	if info, err := f.Stat(); err != nil || !info.Mode().IsRegular() {
 		return nil, "", errInvalidPath
 	}
-	data, err := io.ReadAll(f)
+	data, err := io.ReadAll(io.LimitReader(f, maxMediaBytes+1))
 	if err != nil {
 		return nil, "", errInvalidPath
+	}
+	if int64(len(data)) > maxMediaBytes {
+		return nil, "", errMediaTooLarge
 	}
 	return data, realPath, nil
 }
