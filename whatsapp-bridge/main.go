@@ -776,6 +776,11 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 
 	// Start the server
 	serverAddr := fmt.Sprintf(":%d", port)
+	// WA_BRIDGE_ADDR lets a deployment bind the unauthenticated REST API to loopback
+	// (e.g. 127.0.0.1:8080) behind an authenticating gateway sidecar.
+	if addr := os.Getenv("WA_BRIDGE_ADDR"); addr != "" {
+		serverAddr = addr
+	}
 	fmt.Printf("Starting REST API server on %s...\n", serverAddr)
 
 	// Run server in a goroutine so it doesn't block

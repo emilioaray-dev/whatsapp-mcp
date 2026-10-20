@@ -1,0 +1,32 @@
+name: bridge-image
+
+# Publica ghcr.io/<owner>/whatsapp-mcp/bridge:<versión> al empujar un tag `bridge-vX.Y.Z`.
+# El Deployment del cluster (homelab-mcyve1-infra, apps/whatsapp) fija esa versión.
+on:
+  push:
+    tags: ["bridge-v*"]
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Versión desde el tag
+        id: v
+        run: echo "version=${GITHUB_REF_NAME#bridge-v}" >> "$GITHUB_OUTPUT"
+      - uses: docker/build-push-action@v6
+        with:
+          context: whatsapp-bridge
+          platforms: linux/amd64
+          push: true
+          tags: ghcr.io/${{ github.repository }}/bridge:${{ steps.v.outputs.version }}
